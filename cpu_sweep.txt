@@ -1,0 +1,10 @@
+ok    100 kpps, ring 1024                    100001 pkts  mean    0.301 us
+ok    1 Mpps, ring 1024                     1000051 pkts  mean    0.446 us
+ok    unpaced, ring 1024                   12087036 pkts  mean    4.666 us
+ok    unpaced, ring 64                     13238059 pkts  mean    0.136 us
+ok    bursty, 16 per burst                   500032 pkts  mean    0.606 us
+ok    fixed 200k packets                     200000 pkts  mean    6.071 us
+ok    jumbo payload 9000 B                   200017 pkts  mean    0.238 us
+ok    near-idle, 1 pps                            1 pkts  mean    0.127 us
+
+sweep passed

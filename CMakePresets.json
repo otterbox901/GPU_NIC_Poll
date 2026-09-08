@@ -1,0 +1,61 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "GNP_SIMULATION": "ON",
+        "GNP_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "sim",
+      "inherits": "base",
+      "displayName": "Simulation (auto-detect CUDA)",
+      "description": "Default. Uses the CUDA backend if nvcc is found, the CPU poller otherwise.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "GNP_ENABLE_CUDA": "ON"
+      }
+    },
+    {
+      "name": "sim-cpu",
+      "inherits": "base",
+      "displayName": "Simulation (force CPU poller)",
+      "description": "Ignores any installed CUDA toolkit. Useful for fast protocol iteration.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "GNP_ENABLE_CUDA": "OFF"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "GNP_ENABLE_CUDA": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "sim", "configurePreset": "sim" },
+    { "name": "sim-cpu", "configurePreset": "sim-cpu" },
+    { "name": "debug", "configurePreset": "debug" }
+  ],
+  "testPresets": [
+    {
+      "name": "sim",
+      "configurePreset": "sim",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "sim-cpu",
+      "configurePreset": "sim-cpu",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

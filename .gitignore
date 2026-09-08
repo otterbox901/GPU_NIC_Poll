@@ -1,0 +1,16 @@
+build/
+cmake-build-*/
+out/
+.cache/
+compile_commands.json
+
+# CLion / IDE
+.idea/
+*.iml
+
+*.o
+*.a
+*.so
+*.nsys-rep
+*.ncu-rep
+core.*
