@@ -66,19 +66,25 @@ __global__ void gnp_poll_kernel(CompletionRing ring, RingControl* ctrl, PollStat
             const unsigned int pid = descs[slot].packet_id;
             const unsigned long long post_ns = descs[slot].post_ns;
 
-            const long long now_host = static_cast<long long>(device_now_ns()) + clock_offset_ns;
-            long long lat = now_host - static_cast<long long>(post_ns);
-            if (lat < 0) {
-                lat = 0;
-                ++s.clamped;
+            // Sample latency every 16th packet — %globaltimer every hit was
+            // measurable overhead on the critical path.
+            if ((s.packets & 15ull) == 0) {
+                const long long now_host =
+                    static_cast<long long>(device_now_ns()) + clock_offset_ns;
+                long long lat = now_host - static_cast<long long>(post_ns);
+                if (lat < 0) {
+                    lat = 0;
+                    ++s.clamped;
+                }
+                const unsigned long long ulat = static_cast<unsigned long long>(lat);
+                s.lat_sum_ns += ulat;
+                ++s.lat_samples;
+                if (ulat < s.lat_min_ns) s.lat_min_ns = ulat;
+                if (ulat > s.lat_max_ns) s.lat_max_ns = ulat;
             }
-            const unsigned long long ulat = static_cast<unsigned long long>(lat);
 
             ++s.packets;
             s.bytes += len;
-            s.lat_sum_ns += ulat;
-            if (ulat < s.lat_min_ns) s.lat_min_ns = ulat;
-            if (ulat > s.lat_max_ns) s.lat_max_ns = ulat;
             if (have_prev && pid != next_id) ++s.gaps;
             next_id = pid + 1;
             have_prev = true;
@@ -87,8 +93,8 @@ __global__ void gnp_poll_kernel(CompletionRing ring, RingControl* ctrl, PollStat
 
             if ((idx & kPublishMask) == 0) {
                 ctrl->consumed = idx;
-                *stats = s;
-                // Host must see consumed/stats; system fence only on this path.
+                // Avoid copying the whole stats struct every time; host reads it
+                // at teardown. A release-style system fence publishes `consumed`.
                 __threadfence_system();
                 if (device_now_ns() - t_start > max_run_ns) break;
             }

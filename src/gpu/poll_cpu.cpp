@@ -1,14 +1,11 @@
 //
 // src/gpu/poll_cpu.cpp - CPU-thread stand-in for the persistent CUDA kernel.
 //
-// Compiled ONLY when CMake could not find a CUDA compiler. It runs the exact
-// same owner-bit poll loop on a spinning host thread, which lets the ring, the
-// simulator and the metrics path be developed and tested without nvcc.
-//
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 #include <thread>
 
@@ -22,7 +19,6 @@ constexpr unsigned long long kPublishMask = 63ull;
 
 std::thread g_poller;
 
-/// Mirror of gnp_poll_kernel(). Kept structurally identical on purpose.
 void poll_loop(CompletionRing ring, RingControl* ctrl, PollStats* stats,
                unsigned long long max_run_ns, unsigned int idle_backoff_ns) {
     auto status_of = [](CompletionDesc* d) {
@@ -62,6 +58,7 @@ void poll_loop(CompletionRing ring, RingControl* ctrl, PollStats* stats,
             ++s.packets;
             s.bytes += len;
             s.lat_sum_ns += ulat;
+            ++s.lat_samples;
             if (ulat < s.lat_min_ns) s.lat_min_ns = ulat;
             if (ulat > s.lat_max_ns) s.lat_max_ns = ulat;
             if (have_prev && pid != next_id) ++s.gaps;
@@ -115,6 +112,30 @@ void* backend_alloc_shared(size_t bytes, bool /*write_combined*/) {
 void backend_free_shared(void* p) {
     if (p) ::operator delete(p, std::align_val_t(256));
 }
+
+bool backend_alloc_ring(size_t bytes, CompletionDesc** host_out, CompletionDesc** device_out) {
+    void* p = ::operator new(bytes, std::align_val_t(256), std::nothrow);
+    if (!p) return false;
+    std::memset(p, 0, bytes);
+    *host_out = static_cast<CompletionDesc*>(p);
+    *device_out = static_cast<CompletionDesc*>(p);
+    return true;
+}
+
+void backend_free_ring(CompletionDesc* host, CompletionDesc* device) {
+    (void)device;
+    if (host) ::operator delete(host, std::align_val_t(256));
+}
+
+void backend_flush_descs(CompletionDesc* host, CompletionDesc* device, uint32_t, uint64_t,
+                         uint32_t) {
+    (void)host;
+    (void)device;
+}
+
+void backend_flush_wait() {}
+
+void backend_fini_copy() {}
 
 void* backend_alloc_host(size_t bytes) {
     return ::operator new(bytes, std::align_val_t(64), std::nothrow);

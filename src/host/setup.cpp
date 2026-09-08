@@ -51,28 +51,28 @@ bool session_create(const RunConfig& cfg, Session& out) {
     out.ring.shift = log2_exact(cfg.ring_capacity);
 
     const size_t desc_bytes = static_cast<size_t>(cfg.ring_capacity) * sizeof(CompletionDesc);
-    // Pinned + mapped (coherent): CPU publishes into local DRAM; SM polls over PCIe.
-    // Avoid write-combine here - status is published with an atomic store.
-    out.ring.descs = static_cast<CompletionDesc*>(backend_alloc_shared(desc_bytes, false));
+    CompletionDesc* device_descs = nullptr;
+    if (!backend_alloc_ring(desc_bytes, &out.host_descs, &device_descs)) {
+        std::fprintf(stderr, "[gnp] ring allocation failed\n");
+        session_destroy(out);
+        return false;
+    }
+    out.ring.descs = device_descs;
 
     out.ctrl = static_cast<RingControl*>(backend_alloc_shared(sizeof(RingControl), false));
     out.stats = static_cast<PollStats*>(backend_alloc_shared(sizeof(PollStats), false));
 
-    // Arena is host-only: the poller never inspects payload bytes.
     out.arena_bytes = static_cast<size_t>(cfg.ring_capacity) * cfg.payload_bytes;
     out.arena = static_cast<uint8_t*>(backend_alloc_host(out.arena_bytes));
 
-    if (!out.ring.descs || !out.ctrl || !out.stats || !out.arena) {
+    if (!out.host_descs || !out.ring.descs || !out.ctrl || !out.stats || !out.arena) {
         std::fprintf(stderr, "[gnp] allocation failed\n");
         session_destroy(out);
         return false;
     }
 
-    // Zeroing matters: status == 0 means owner bit 0, and pass 0 expects owner
-    // bit 1, so every slot starts out correctly marked "not ready".
-    std::memset(out.ring.descs, 0, desc_bytes);
     std::memset(out.ctrl, 0, sizeof(RingControl));
-    out.ctrl->publish_limit = ~0ull;  // unlimited until host posts the final count
+    out.ctrl->publish_limit = ~0ull;
     std::memset(out.arena, 0, out.arena_bytes);
     stats_reset(*out.stats);
 
@@ -83,6 +83,9 @@ bool session_create(const RunConfig& cfg, Session& out) {
         std::printf("[gnp] ring: %u entries (%zu KiB), arena %zu KiB (host-only), clock offset %+lld ns\n",
                     cfg.ring_capacity, desc_bytes / 1024, out.arena_bytes / 1024,
                     static_cast<long long>(out.clock_offset_ns));
+        std::printf("[gnp] ring pointers: host_staging=%p device_cq=%p%s\n",
+                    static_cast<void*>(out.host_descs), static_cast<void*>(out.ring.descs),
+                    out.host_descs == out.ring.descs ? " (alias)" : "");
     }
     return true;
 }
@@ -91,7 +94,7 @@ void session_destroy(Session& s) {
     backend_free_host(s.arena);
     backend_free_shared(s.stats);
     backend_free_shared(s.ctrl);
-    backend_free_shared(s.ring.descs);
+    backend_free_ring(s.host_descs, s.ring.descs);
     s = Session{};
     backend_shutdown();
 }

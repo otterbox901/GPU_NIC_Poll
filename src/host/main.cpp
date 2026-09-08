@@ -117,9 +117,12 @@ int main(int argc, char** argv) {
     }
 
     // 2. Then the producer. In the hardware build this is the NIC's Rx queue.
-    gnp::Simulator* sim = gnp::sim_start(session.ring, session.ctrl, session.arena,
+    //    It writes host staging; flushes copy CQEs into the device ring the SM polls.
+    gnp::CompletionRing host_ring = session.ring;
+    host_ring.descs = session.host_descs;
+    gnp::Simulator* sim = gnp::sim_start(host_ring, session.ring.descs, session.ctrl, session.arena,
                                          session.arena_bytes, cfg);
-        if (!sim) {
+    if (!sim) {
         std::fprintf(stderr, "[gnp] failed to start the simulator\n");
         reinterpret_cast<std::atomic<unsigned long long>*>(&session.ctrl->publish_limit)
             ->store(0ull, std::memory_order_release);
@@ -140,6 +143,8 @@ int main(int argc, char** argv) {
 
     gnp::SimStats sim_stats;
     gnp::sim_stop(sim, sim_stats);
+    // sim_stop already flushed + waited; belt-and-suspenders for the copy stream.
+    gnp::backend_flush_wait();
 
     // 4. Retire the poller. publish_limit first, then stop_flag: the kernel only
     //    leaves the idle path once idx has caught the final produced count, so a

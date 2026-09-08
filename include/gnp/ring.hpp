@@ -88,9 +88,10 @@ struct Simulator;  ///< opaque; owns the injection thread
 void sim_publish(const CompletionRing& ring, uint64_t idx, uint64_t payload_offset,
                  uint32_t byte_len, uint32_t packet_id, uint64_t post_ns);
 
-/// Start the injection thread. Returns nullptr on failure.
-Simulator* sim_start(const CompletionRing& ring, RingControl* ctrl, uint8_t* arena,
-                     size_t arena_bytes, const RunConfig& cfg);
+/// Start the injection thread. `host_ring.descs` is the producer staging buffer;
+/// `device_descs` is what the poller reads (may alias host on the CPU backend).
+Simulator* sim_start(const CompletionRing& host_ring, CompletionDesc* device_descs,
+                     RingControl* ctrl, uint8_t* arena, size_t arena_bytes, const RunConfig& cfg);
 
 /// Join the injection thread and collect its counters. Frees the Simulator.
 void sim_stop(Simulator* sim, SimStats& out);

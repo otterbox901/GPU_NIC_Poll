@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "gnp/common.hpp"
+#include "gnp/gpu_poll.hpp"
 #include "gnp/ring.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -25,6 +26,11 @@ inline void cpu_relax() {
     _mm_pause();
 #endif
 }
+
+/// Flush host staging into the device CQ the SM polls. Batches of at least
+/// kFlushBatch cut CUDA launch overhead on the unpaced path; paced runs flush
+/// every burst so detection latency stays honest.
+constexpr uint32_t kFlushBatch = 32;
 
 }  // namespace
 
@@ -56,10 +62,9 @@ struct Simulator {
 
 namespace {
 
-void inject_loop(Simulator* sim, CompletionRing ring, RingControl* ctrl, uint8_t* arena,
-                 RunConfig cfg) {
+void inject_loop(Simulator* sim, CompletionRing host_ring, CompletionDesc* device_descs,
+                 RingControl* ctrl, uint8_t* arena, RunConfig cfg) {
     const uint32_t burst = cfg.burst ? cfg.burst : 1u;
-    // Nanoseconds between bursts. 0 means "as fast as the CPU can go".
     const uint64_t interval_ns =
         cfg.target_pps ? (1000000000ull * burst) / cfg.target_pps : 0ull;
 
@@ -67,15 +72,24 @@ void inject_loop(Simulator* sim, CompletionRing ring, RingControl* ctrl, uint8_t
         reinterpret_cast<const std::atomic<unsigned long long>*>(&ctrl->consumed);
 
     uint64_t produced = 0;
+    uint64_t flushed = 0;
     uint64_t overruns = 0;
     sim->stats.start_ns = host_now_ns();
     uint64_t next_ns = sim->stats.start_ns;
+
+    auto flush_available = [&](bool force) {
+        const uint64_t n = produced - flushed;
+        if (n == 0) return;
+        if (!force && n < kFlushBatch) return;
+        backend_flush_descs(host_ring.descs, device_descs, host_ring.capacity, flushed,
+                            static_cast<uint32_t>(n));
+        flushed = produced;
+    };
 
     while (!sim->stop.load(std::memory_order_relaxed)) {
         if (cfg.max_packets && produced >= cfg.max_packets) break;
 
         if (interval_ns) {
-            // Busy-wait: sleep_for cannot pace anywhere near microsecond periods.
             while (host_now_ns() < next_ns) {
                 if (sim->stop.load(std::memory_order_relaxed)) goto done;
                 cpu_relax();
@@ -83,34 +97,35 @@ void inject_loop(Simulator* sim, CompletionRing ring, RingControl* ctrl, uint8_t
             next_ns += interval_ns;
         }
 
+        const uint64_t burst_start = produced;
         for (uint32_t b = 0; b < burst; ++b) {
             if (cfg.max_packets && produced >= cfg.max_packets) break;
 
-            // Back-pressure. The consumer publishes its index every 64 entries,
-            // so this watermark is slightly stale - harmless, it only ever makes
-            // us more conservative.
-            while (produced - consumed->load(std::memory_order_acquire) >= ring.capacity) {
+            while (produced - consumed->load(std::memory_order_acquire) >= host_ring.capacity) {
+                flush_available(true);  // free slots only appear after H2D + poll
                 ++overruns;
                 if (sim->stop.load(std::memory_order_relaxed)) goto done;
                 cpu_relax();
             }
 
             const uint64_t offset =
-                static_cast<uint64_t>(ring_slot(ring, produced)) * cfg.payload_bytes;
+                static_cast<uint64_t>(ring_slot(host_ring, produced)) * cfg.payload_bytes;
 
-            // Simulated DMA. We write a 16-byte header rather than the whole
-            // payload: the producer has to keep up with target_pps, and pushing
-            // full packets over PCIe uncached would make the injector, not the
-            // poller, the bottleneck.
             const uint32_t id = static_cast<uint32_t>(produced);
             std::memcpy(arena + offset, &id, sizeof(id));
 
-            sim_publish(ring, produced, offset, cfg.payload_bytes, id, host_now_ns());
+            sim_publish(host_ring, produced, offset, cfg.payload_bytes, id, host_now_ns());
             ++produced;
         }
+
+        // Paced: flush each burst for low detection latency.
+        // Unpaced: coalesce into kFlushBatch to amortise launch cost.
+        flush_available(interval_ns != 0 || (produced - burst_start) >= kFlushBatch);
     }
 
 done:
+    flush_available(true);
+    backend_flush_wait();
     sim->stats.produced = produced;
     sim->stats.overruns = overruns;
     sim->stats.end_ns = host_now_ns();
@@ -118,13 +133,13 @@ done:
 
 }  // namespace
 
-Simulator* sim_start(const CompletionRing& ring, RingControl* ctrl, uint8_t* arena,
-                     size_t arena_bytes, const RunConfig& cfg) {
-    if (!ring.descs || !ctrl || !arena) return nullptr;
-    if (arena_bytes < static_cast<size_t>(ring.capacity) * cfg.payload_bytes) return nullptr;
+Simulator* sim_start(const CompletionRing& host_ring, CompletionDesc* device_descs,
+                     RingControl* ctrl, uint8_t* arena, size_t arena_bytes, const RunConfig& cfg) {
+    if (!host_ring.descs || !device_descs || !ctrl || !arena) return nullptr;
+    if (arena_bytes < static_cast<size_t>(host_ring.capacity) * cfg.payload_bytes) return nullptr;
 
     auto* sim = new Simulator();
-    sim->thread = std::thread(inject_loop, sim, ring, ctrl, arena, cfg);
+    sim->thread = std::thread(inject_loop, sim, host_ring, device_descs, ctrl, arena, cfg);
     return sim;
 }
 

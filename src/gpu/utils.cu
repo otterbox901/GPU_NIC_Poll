@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -28,24 +29,9 @@ __global__ void gnp_clock_probe(volatile unsigned int* flag, unsigned long long*
     *out = device_now_ns();
 }
 
-/// Pull completed CQEs from pinned host staging into the device-resident ring.
-/// Each lane copies one descriptor and publishes status last.
-__global__ void gnp_flush_kernel(CompletionDesc* device, const CompletionDesc* host,
-                                 uint32_t start_slot, uint32_t count, uint32_t mask) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-
-    const uint32_t slot = (start_slot + i) & mask;
-    const CompletionDesc src = host[slot];
-
-    device[slot].payload_offset = src.payload_offset;
-    device[slot].byte_len = src.byte_len;
-    device[slot].packet_id = src.packet_id;
-    device[slot].post_ns = src.post_ns;
-    device[slot].reserved = src.reserved;
-    __threadfence();
-    device[slot].status = src.status;
-}
+// NOTE: H2D flush uses the DMA copy engine (cudaMemcpyAsync), not a compute
+// kernel. A persistent poller would starve a flush kernel on this GPU; the copy
+// engine runs concurrently with the SM poll loop.
 
 }  // namespace
 
@@ -66,7 +52,7 @@ bool backend_init(bool verbose) {
 
     GNP_CUDA_CHECK(cudaSetDevice(g_device));
     GNP_CUDA_CHECK(cudaStreamCreateWithFlags(&g_copy_stream, cudaStreamNonBlocking));
-    g_mem_strategy = "device CQ + pinned host staging (batched H2D flush)";
+    g_mem_strategy = "device CQ + pinned staging (DMA H2D flush)";
 
     if (verbose) {
         cudaDeviceProp p{};
@@ -114,17 +100,20 @@ void backend_flush_descs(CompletionDesc* host, CompletionDesc* device, uint32_t 
                          uint64_t start_idx, uint32_t count) {
     if (!host || !device || count == 0 || host == device) return;
 
+    // DMA copy engine runs concurrently with the persistent poller. Prefer one
+    // contiguous memcpy per non-wrapping span. status is the last field of each
+    // CQE, so address-ordered DMA publishes the owner bit after the payload.
     const uint32_t mask = capacity - 1;
-    const uint32_t start_slot = static_cast<uint32_t>(start_idx) & mask;
+    uint32_t slot = static_cast<uint32_t>(start_idx) & mask;
+    uint32_t left = count;
 
-    constexpr int kThreads = 64;
-    const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
-    gnp_flush_kernel<<<blocks, kThreads, 0, g_copy_stream>>>(device, host, start_slot, count,
-                                                              mask);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "[gnp] flush launch failed: %s\n", cudaGetErrorString(e));
-        std::abort();
+    while (left > 0) {
+        const uint32_t span = (slot + left <= capacity) ? left : (capacity - slot);
+        const size_t bytes = static_cast<size_t>(span) * sizeof(CompletionDesc);
+        GNP_CUDA_CHECK(cudaMemcpyAsync(device + slot, host + slot, bytes, cudaMemcpyHostToDevice,
+                                       g_copy_stream));
+        slot = (slot + span) & mask;
+        left -= span;
     }
 }
 

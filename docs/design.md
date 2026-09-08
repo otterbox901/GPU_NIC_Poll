@@ -68,21 +68,28 @@ payload loads from floating above it.
 
 ## Memory placement
 
-`backend_alloc_shared()` uses **pinned, mapped host memory** (`cudaHostAlloc` +
-`cudaHostAllocMapped`). The CPU producer writes into local DRAM; the SM polls
-those cache lines over PCIe. That is the opposite of the eventual NIC topology
-(DMA into GPU DRAM), but it is the right model while the producer is a host
-thread: `cudaMallocManaged` with a GPU-preferred location thrash-migrates pages
-under bidirectional touch and shows up as multi-millisecond detection latency.
+The CUDA backend keeps **two** copies of the completion ring:
 
-The payload arena is ordinary host memory — the poller never reads packet bytes.
+1. **Host staging** (`cudaHostAlloc` mapped) — the simulated NIC publishes here.
+2. **Device CQ** (`cudaMalloc`) — the persistent poller reads here, so status
+   loads hit GDDR instead of bouncing over PCIe every spin.
 
-When a real NIC arrives, swap the allocator to device memory (or DOCA GPUNetIO
-buffers). The owner-bit protocol and the poll kernel stay the same.
+`backend_flush_descs()` pushes completed CQEs across with the **DMA copy
+engine** (`cudaMemcpyAsync`), two-phase per slot (payload fields, then owner
+bit). A compute flush kernel was tried and abandoned: the persistent poller
+starves other kernels on this GPU, whereas the copy engine runs concurrently.
+Unpaced runs batch 32 CQEs per flush; paced runs flush every burst.
 
-Device-side loads are `volatile`. The GPU L1 is not coherent with writes
-arriving from outside the SM, so a cached read would spin forever on a stale
-value.
+Control/stats stay in pinned mapped memory (both sides read/write them). The
+payload arena is ordinary host memory — the poller never inspects packet bytes.
+
+`cudaMallocManaged` with a GPU-preferred location was tried first and abandoned:
+bidirectional touch thrash-migrates pages and shows up as multi-millisecond
+detection latency. A real NIC will DMA straight into the device CQ and the flush
+step disappears; the poller does not change.
+
+Device-side CQ loads use `ld.acquire.gpu` on the owner bit so payload fields
+cannot float above the status store.
 
 ## Why one thread
 

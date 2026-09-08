@@ -16,9 +16,10 @@ struct PollStats {
     unsigned long long packets;        ///< descriptors observed
     unsigned long long bytes;          ///< sum of byte_len
     unsigned long long idle_spins;     ///< poll iterations that found nothing
-    unsigned long long lat_sum_ns;     ///< sum of publish -> detect latency
+    unsigned long long lat_sum_ns;     ///< sum of sampled publish -> detect latency
     unsigned long long lat_min_ns;
     unsigned long long lat_max_ns;
+    unsigned long long lat_samples;    ///< how many packets contributed to lat_*
     unsigned long long gaps;           ///< packet_id discontinuities
     unsigned long long clamped;        ///< latencies clamped to 0 by clock skew
     unsigned long long drain_spins;    ///< idle spins after stop while catching publish_limit

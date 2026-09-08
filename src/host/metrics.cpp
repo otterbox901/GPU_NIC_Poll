@@ -72,13 +72,15 @@ void report(const RunConfig& cfg, const PollStats& poll, const SimStats& sim, co
 
     std::printf("\n  detection latency (publish -> SM observes)\n");
     rule();
-    if (poll.packets) {
+    if (poll.lat_samples) {
         row_f64("min", poll.lat_min_ns / 1000.0, "us");
-        row_f64("mean", (poll.lat_sum_ns / static_cast<double>(poll.packets)) / 1000.0, "us");
+        row_f64("mean", (poll.lat_sum_ns / static_cast<double>(poll.lat_samples)) / 1000.0, "us");
         row_f64("max", poll.lat_max_ns / 1000.0, "us");
         if (poll.clamped) {
             row_u64("clamped to zero", poll.clamped, "(clock-offset error)");
         }
+    } else if (poll.packets) {
+        std::printf("  %-28s %14s\n", "latency", "(not sampled)");
     } else {
         std::printf("  %-28s %14s\n", "no packets observed", "-");
     }
