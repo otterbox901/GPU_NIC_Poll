@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <new>
 
 #include "gnp/common.hpp"
 #include "gnp/gpu_poll.hpp"
@@ -13,8 +14,8 @@ namespace gnp {
 namespace {
 
 int  g_device = 0;
-bool g_concurrent_managed = false;  ///< can the CPU touch managed memory mid-kernel?
 bool g_initialised = false;
+const char* g_mem_strategy = "uninitialised";
 
 /// Spins until the host raises `flag`, then records the GPU clock.
 ///
@@ -31,6 +32,8 @@ __global__ void gnp_clock_probe(volatile unsigned int* flag, unsigned long long*
 
 const char* backend_name() { return "cuda"; }
 
+const char* backend_memory_strategy() { return g_mem_strategy; }
+
 bool backend_init(bool verbose) {
     if (g_initialised) return true;
 
@@ -43,62 +46,39 @@ bool backend_init(bool verbose) {
     }
 
     GNP_CUDA_CHECK(cudaSetDevice(g_device));
-
-    int concurrent = 0;
-    GNP_CUDA_CHECK(
-        cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentManagedAccess, g_device));
-    g_concurrent_managed = concurrent != 0;
+    g_mem_strategy = "pinned-mapped host (coherent)";
 
     if (verbose) {
         cudaDeviceProp p{};
         GNP_CUDA_CHECK(cudaGetDeviceProperties(&p, g_device));
         std::printf("[gnp] device %d: %s (sm_%d%d, %d SMs)\n", g_device, p.name, p.major, p.minor,
                     p.multiProcessorCount);
-        std::printf("[gnp] shared-memory strategy: %s\n",
-                    g_concurrent_managed ? "managed, preferred location = device"
-                                         : "zero-copy pinned host (no concurrent managed access)");
+        std::printf("[gnp] shared-memory strategy: %s\n", g_mem_strategy);
+        std::printf("[gnp] note: 1 block x 1 thread poller (CQ is strictly ordered)\n");
     }
 
     g_initialised = true;
     return true;
 }
 
-    void* backend_alloc_shared(size_t bytes) {
+void* backend_alloc_shared(size_t bytes, bool write_combined) {
     void* p = nullptr;
-    if (g_concurrent_managed) {
-        // Pin the pages in GPU DRAM and let the CPU reach them over PCIe. This
-        // mirrors the target topology: the ring lives in GPU memory, and writes
-        // to it arrive from the far side of the bus - CPU today, NIC later.
-        GNP_CUDA_CHECK(cudaMallocManaged(&p, bytes));
-
-        // Preferred location = GPU
-        cudaMemLocation device_loc{};
-        device_loc.type = cudaMemLocationTypeDevice;
-        device_loc.id   = g_device;
-        GNP_CUDA_CHECK(cudaMemAdvise(p, bytes, cudaMemAdviseSetPreferredLocation, device_loc));
-
-        // Make it accessible from the CPU
-        cudaMemLocation host_loc{};
-        host_loc.type = cudaMemLocationTypeHost;
-        host_loc.id   = 0;
-        GNP_CUDA_CHECK(cudaMemAdvise(p, bytes, cudaMemAdviseSetAccessedBy, host_loc));
-    } else {
-        // Platforms without concurrent managed access (WSL, Windows) would fault
-        // on the CPU store above. Zero-copy pinned memory keeps one pointer
-        // valid on both sides thanks to UVA, at the cost of inverting where the
-        // ring physically lives.
-        GNP_CUDA_CHECK(cudaHostAlloc(&p, bytes, cudaHostAllocMapped));
-    }
+    unsigned flags = cudaHostAllocMapped;
+    if (write_combined) flags |= cudaHostAllocWriteCombined;
+    GNP_CUDA_CHECK(cudaHostAlloc(&p, bytes, flags));
     return p;
 }
 
 void backend_free_shared(void* p) {
-    if (!p) return;
-    if (g_concurrent_managed) {
-        cudaFree(p);
-    } else {
-        cudaFreeHost(p);
-    }
+    if (p) cudaFreeHost(p);
+}
+
+void* backend_alloc_host(size_t bytes) {
+    return ::operator new(bytes, std::align_val_t(64), std::nothrow);
+}
+
+void backend_free_host(void* p) {
+    if (p) ::operator delete(p, std::align_val_t(64));
 }
 
 int64_t backend_clock_offset_ns() {

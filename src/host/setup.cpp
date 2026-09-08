@@ -51,18 +51,19 @@ bool session_create(const RunConfig& cfg, Session& out) {
     out.ring.shift = log2_exact(cfg.ring_capacity);
 
     const size_t desc_bytes = static_cast<size_t>(cfg.ring_capacity) * sizeof(CompletionDesc);
-    out.ring.descs = static_cast<CompletionDesc*>(backend_alloc_shared(desc_bytes));
+    // Pinned + mapped (coherent): CPU publishes into local DRAM; SM polls over PCIe.
+    // Avoid write-combine here - status is published with an atomic store.
+    out.ring.descs = static_cast<CompletionDesc*>(backend_alloc_shared(desc_bytes, false));
 
-    out.ctrl = static_cast<RingControl*>(backend_alloc_shared(sizeof(RingControl)));
-    out.stats = static_cast<PollStats*>(backend_alloc_shared(sizeof(PollStats)));
+    out.ctrl = static_cast<RingControl*>(backend_alloc_shared(sizeof(RingControl), false));
+    out.stats = static_cast<PollStats*>(backend_alloc_shared(sizeof(PollStats), false));
 
-    // One payload slot per descriptor, so a packet is never overwritten while
-    // its descriptor is still outstanding.
+    // Arena is host-only: the poller never inspects payload bytes.
     out.arena_bytes = static_cast<size_t>(cfg.ring_capacity) * cfg.payload_bytes;
-    out.arena = static_cast<uint8_t*>(backend_alloc_shared(out.arena_bytes));
+    out.arena = static_cast<uint8_t*>(backend_alloc_host(out.arena_bytes));
 
     if (!out.ring.descs || !out.ctrl || !out.stats || !out.arena) {
-        std::fprintf(stderr, "[gnp] shared allocation failed\n");
+        std::fprintf(stderr, "[gnp] allocation failed\n");
         session_destroy(out);
         return false;
     }
@@ -71,13 +72,15 @@ bool session_create(const RunConfig& cfg, Session& out) {
     // bit 1, so every slot starts out correctly marked "not ready".
     std::memset(out.ring.descs, 0, desc_bytes);
     std::memset(out.ctrl, 0, sizeof(RingControl));
+    out.ctrl->publish_limit = ~0ull;  // unlimited until host posts the final count
     std::memset(out.arena, 0, out.arena_bytes);
     stats_reset(*out.stats);
 
     out.clock_offset_ns = backend_clock_offset_ns();
 
     if (cfg.verbose) {
-        std::printf("[gnp] ring: %u entries (%zu KiB), arena %zu KiB, clock offset %+lld ns\n",
+        std::printf("[gnp] memory: %s\n", backend_memory_strategy());
+        std::printf("[gnp] ring: %u entries (%zu KiB), arena %zu KiB (host-only), clock offset %+lld ns\n",
                     cfg.ring_capacity, desc_bytes / 1024, out.arena_bytes / 1024,
                     static_cast<long long>(out.clock_offset_ns));
     }
@@ -85,7 +88,7 @@ bool session_create(const RunConfig& cfg, Session& out) {
 }
 
 void session_destroy(Session& s) {
-    backend_free_shared(s.arena);
+    backend_free_host(s.arena);
     backend_free_shared(s.stats);
     backend_free_shared(s.ctrl);
     backend_free_shared(s.ring.descs);

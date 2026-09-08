@@ -47,6 +47,9 @@ void report(const RunConfig& cfg, const PollStats& poll, const SimStats& sim, co
     row_u64("bytes observed", poll.bytes);
     row_u64("packet-id gaps", poll.gaps);
     row_u64("idle poll iterations", poll.idle_spins);
+    if (poll.drain_spins) {
+        row_u64("post-stop drain spins", poll.drain_spins);
+    }
     if (poll.packets) {
         row_f64("idle spins per packet", static_cast<double>(poll.idle_spins) / poll.packets, "");
     }

@@ -13,14 +13,15 @@ namespace gnp {
 /// `unsigned long long` throughout so the fields stay atomicAdd-compatible if
 /// the poll loop is ever widened to more than one thread.
 struct PollStats {
-    unsigned long long packets;      ///< descriptors observed
-    unsigned long long bytes;        ///< sum of byte_len
-    unsigned long long idle_spins;   ///< poll iterations that found nothing
-    unsigned long long lat_sum_ns;   ///< sum of publish -> detect latency
+    unsigned long long packets;        ///< descriptors observed
+    unsigned long long bytes;          ///< sum of byte_len
+    unsigned long long idle_spins;     ///< poll iterations that found nothing
+    unsigned long long lat_sum_ns;     ///< sum of publish -> detect latency
     unsigned long long lat_min_ns;
     unsigned long long lat_max_ns;
-    unsigned long long gaps;         ///< packet_id discontinuities
-    unsigned long long clamped;      ///< latencies clamped to 0 by clock skew
+    unsigned long long gaps;           ///< packet_id discontinuities
+    unsigned long long clamped;        ///< latencies clamped to 0 by clock skew
+    unsigned long long drain_spins;    ///< idle spins after stop while catching publish_limit
 };
 
 void stats_reset(PollStats& s);

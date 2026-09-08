@@ -24,6 +24,12 @@ loop on a host thread (`src/gpu/poll_cpu.cpp`) so the ring, simulator, metrics
 and tests still work. Which one is active is printed at configure time
 (`gnp: simulation=ON cuda=ON/OFF ...`) and in every run summary.
 
+The CUDA backend keeps the completion ring in **pinned mapped host memory** so
+the CPU producer writes locally and the SM polls over PCIe. That avoids
+`cudaMallocManaged` page-migration thrashing while the producer is still a host
+thread; a real NIC will DMA into device memory later without changing the
+poller.
+
 ## Run
 
 ```bash

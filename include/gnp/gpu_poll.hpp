@@ -21,11 +21,25 @@ const char* backend_name();
 /// Select/probe the device. Returns false if the backend is unusable.
 bool backend_init(bool verbose);
 
-/// Allocate memory both the producer (CPU/NIC) and the consumer (SM) can reach.
-/// Under CUDA this is managed memory pinned to the device, so host stores travel
-/// over PCIe into GPU DRAM - the same direction a real NIC DMA would take.
-void* backend_alloc_shared(size_t bytes);
+/// Allocate memory both the producer (CPU) and the consumer (SM) can reach.
+///
+/// CUDA backend uses pinned, mapped host memory (optionally write-combined for
+/// the ring). That keeps CPU publishes in local DRAM and lets the SM poll over
+/// PCIe - orders of magnitude faster than cudaMallocManaged with GPU-preferred
+/// pages, which thrash under bidirectional touch. A real NIC will DMA into
+/// device memory later; the poller interface stays the same.
+///
+/// `write_combined` is a hint for producer-heavy buffers (the CQ ring). Control
+/// and stats must pass false so the host can read them back.
+void* backend_alloc_shared(size_t bytes, bool write_combined = false);
 void  backend_free_shared(void* p);
+
+/// Host-only allocation (payload arena). The poller never touches packet bytes.
+void* backend_alloc_host(size_t bytes);
+void  backend_free_host(void* p);
+
+/// Short string describing the active shared-memory strategy (for --verbose).
+const char* backend_memory_strategy();
 
 /// Nanoseconds to add to a device timestamp to express it on the host_now_ns()
 /// epoch. Zero for the CPU fallback.

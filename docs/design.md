@@ -68,20 +68,17 @@ payload loads from floating above it.
 
 ## Memory placement
 
-`backend_alloc_shared()` prefers `cudaMallocManaged` with:
+`backend_alloc_shared()` uses **pinned, mapped host memory** (`cudaHostAlloc` +
+`cudaHostAllocMapped`). The CPU producer writes into local DRAM; the SM polls
+those cache lines over PCIe. That is the opposite of the eventual NIC topology
+(DMA into GPU DRAM), but it is the right model while the producer is a host
+thread: `cudaMallocManaged` with a GPU-preferred location thrash-migrates pages
+under bidirectional touch and shows up as multi-millisecond detection latency.
 
-- `cudaMemAdviseSetPreferredLocation` → the GPU
-- `cudaMemAdviseSetAccessedBy` → the CPU
+The payload arena is ordinary host memory — the poller never reads packet bytes.
 
-which pins the pages in GPU DRAM and lets host stores reach them over PCIe.
-That is the same direction of travel a real NIC DMA takes, so the simulator
-exercises a realistic write path rather than a convenient one.
-
-This requires `cudaDevAttrConcurrentManagedAccess` — without it, a CPU store to
-managed memory while a kernel is resident faults. Platforms that lack it (WSL,
-Windows) fall back to zero-copy pinned host memory, which keeps a single valid
-pointer thanks to UVA but inverts where the ring physically sits. The active
-strategy is printed under `--verbose`.
+When a real NIC arrives, swap the allocator to device memory (or DOCA GPUNetIO
+buffers). The owner-bit protocol and the poll kernel stay the same.
 
 Device-side loads are `volatile`. The GPU L1 is not coherent with writes
 arriving from outside the SM, so a cached read would spin forever on a stale
@@ -96,10 +93,12 @@ and that is out of scope for v1 — see "Next steps".
 
 ## Stopping
 
-`RingControl::stop_flag` is host→device. The kernel checks it **only on the idle
-path**, which is what guarantees a clean drain: the host quiesces the producer
-first, so by the time the poller next finds an empty slot, every published
-descriptor has already been counted.
+`RingControl::publish_limit` and `stop_flag` are host→device. After the producer
+quiesces, the host stores the final produced count into `publish_limit`, fences,
+then raises `stop_flag`. The kernel checks these **only on the idle path**, and
+only retires once `idx >= publish_limit`. That closes the race where `stop`
+becomes visible before the last CQE status bit — which previously showed up as
+`published == observed + 1` on small rings.
 
 There is also a hard `max_run_ns` ceiling (requested duration + 5 s) checked
 every 1024 idle spins and every 64 packets, so a crashed host cannot wedge the

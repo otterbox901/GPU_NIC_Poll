@@ -3,7 +3,7 @@
 //
 // This is the heart of the project: a long-running CUDA kernel that watches the
 // completion ring from an SM and never asks the CPU for anything. The only
-// host interaction is a single stop flag, checked on the idle path.
+// host interaction is stop_flag + publish_limit, checked on the idle path.
 //
 
 #include <cuda_runtime.h>
@@ -25,46 +25,48 @@ cudaStream_t g_stream = nullptr;
 
 }  // namespace
 
-/// Poll the ring until the host asks us to stop.
-///
-/// Single-threaded on purpose. A completion queue is consumed strictly in
-/// order, so exactly one lane can own the head; additional lanes would only
-/// contend on the same descriptor. Payload *processing* is where extra threads
-/// belong, and that is deliberately out of scope for v1.
+/// Poll the ring until the host asks us to stop *and* we have reached the
+/// publish limit. Single-threaded on purpose: a CQ is consumed in order.
 __global__ void gnp_poll_kernel(CompletionRing ring, RingControl* ctrl, PollStats* stats,
                                 long long clock_offset_ns, unsigned long long max_run_ns,
                                 unsigned int idle_backoff_ns) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
-    // volatile => every load goes past the non-coherent L1. The producer's
-    // stores arrive from outside this SM, so cached reads would spin forever.
+    // volatile => every load goes past the non-coherent L1. Producer stores
+    // arrive from outside this SM (host mapped memory over PCIe).
     volatile CompletionDesc* descs = ring.descs;
     volatile unsigned int* stop = &ctrl->stop_flag;
+    volatile unsigned long long* publish_limit = &ctrl->publish_limit;
 
     const unsigned long long t_start = device_now_ns();
 
     PollStats s = {};
     s.lat_min_ns = ~0ull;
 
-    unsigned long long idx = 0;  // monotonic consumer index
+    unsigned long long idx = 0;
     unsigned int next_id = 0;
     bool have_prev = false;
+    bool saw_stop = false;
 
     for (;;) {
         const unsigned int slot = ring_slot(ring, idx);
         const unsigned int want = ring_expected_owner(ring, idx);
 
-        if (desc_ready(descs[slot].status, want)) {
-            // The producer published `status` last. Keep the payload loads from
-            // floating above it.
-            __threadfence_system();
+        // System-scoped acquire on the owner bit: once we observe the producer's
+        // status store, subsequent payload loads cannot float above it. Much
+        // cheaper than __threadfence_system() on every hit (that was dominating
+        // the per-packet service time when the ring lives in mapped host memory).
+        unsigned int st;
+        asm volatile("ld.acquire.sys.u32 %0, [%1];"
+                     : "=r"(st)
+                     : "l"(&descs[slot].status)
+                     : "memory");
 
+        if (desc_ready(st, want)) {
             const unsigned int len = descs[slot].byte_len;
             const unsigned int pid = descs[slot].packet_id;
             const unsigned long long post_ns = descs[slot].post_ns;
 
-            // Translate the GPU clock onto the host epoch so the difference is
-            // meaningful. Residual calibration error can make this negative.
             const long long now_host = static_cast<long long>(device_now_ns()) + clock_offset_ns;
             long long lat = now_host - static_cast<long long>(post_ns);
             if (lat < 0) {
@@ -87,15 +89,22 @@ __global__ void gnp_poll_kernel(CompletionRing ring, RingControl* ctrl, PollStat
             if ((idx & kPublishMask) == 0) {
                 ctrl->consumed = idx;
                 *stats = s;
+                // Host must see consumed/stats; system fence only on this path.
                 __threadfence_system();
-                // Safety net only: never trust the host to still be alive.
                 if (device_now_ns() - t_start > max_run_ns) break;
             }
         } else {
             ++s.idle_spins;
-            // Checking the stop flag only here guarantees we drain the ring
-            // first: the host sets it after the producer has already quiesced.
-            if (*stop) break;
+
+            // Drain protocol: stop alone is not enough. Host publishes the final
+            // produced count first; we only retire once idx has caught it.
+            if (*stop) {
+                if (!saw_stop) saw_stop = true;
+                else ++s.drain_spins;
+                __threadfence_system();
+                if (idx >= *publish_limit) break;
+            }
+
             if ((s.idle_spins & 1023ull) == 0 && device_now_ns() - t_start > max_run_ns) break;
 #if __CUDA_ARCH__ >= 700
             if (idle_backoff_ns) __nanosleep(idle_backoff_ns);
@@ -114,7 +123,6 @@ bool backend_launch_poller(const CompletionRing& ring, RingControl* ctrl, PollSt
         GNP_CUDA_CHECK(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
     }
 
-    // Hard ceiling on kernel lifetime, well past the requested duration.
     const unsigned long long max_run_ns =
         (static_cast<unsigned long long>(cfg.duration_ms) + 5000ull) * 1000000ull;
 

@@ -119,8 +119,11 @@ int main(int argc, char** argv) {
     // 2. Then the producer. In the hardware build this is the NIC's Rx queue.
     gnp::Simulator* sim = gnp::sim_start(session.ring, session.ctrl, session.arena,
                                          session.arena_bytes, cfg);
-    if (!sim) {
+        if (!sim) {
         std::fprintf(stderr, "[gnp] failed to start the simulator\n");
+        reinterpret_cast<std::atomic<unsigned long long>*>(&session.ctrl->publish_limit)
+            ->store(0ull, std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         reinterpret_cast<std::atomic<uint32_t>*>(&session.ctrl->stop_flag)
             ->store(1u, std::memory_order_release);
         gnp::backend_wait_poller();
@@ -138,8 +141,12 @@ int main(int argc, char** argv) {
     gnp::SimStats sim_stats;
     gnp::sim_stop(sim, sim_stats);
 
-    // 4. Retire the poller. It only reads the flag on its idle path, so setting
-    //    it after the producer has quiesced guarantees the ring is drained.
+    // 4. Retire the poller. publish_limit first, then stop_flag: the kernel only
+    //    leaves the idle path once idx has caught the final produced count, so a
+    //    stop that becomes visible before the last CQE cannot truncate the drain.
+    reinterpret_cast<std::atomic<unsigned long long>*>(&session.ctrl->publish_limit)
+        ->store(sim_stats.produced, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     reinterpret_cast<std::atomic<uint32_t>*>(&session.ctrl->stop_flag)
         ->store(1u, std::memory_order_release);
 

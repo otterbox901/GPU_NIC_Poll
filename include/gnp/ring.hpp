@@ -44,9 +44,14 @@ struct CompletionRing {
 
 /// Out-of-band control block. Kept separate so the ring stays a pure data plane.
 struct RingControl {
-    uint32_t stop_flag;             ///< host -> device: 1 retires the persistent kernel
+    uint32_t stop_flag;                  ///< host -> device: retire request (see publish_limit)
     uint32_t _pad;
-    unsigned long long consumed;    ///< device -> host: consumer index, updated periodically
+    unsigned long long consumed;         ///< device -> host: consumer index, updated periodically
+    /// Host sets this to the final produced count *before* stop_flag. ~0ull means
+    /// "no limit yet". The poller only retires on the idle path once
+    /// `idx >= publish_limit`, so a stop that races ahead of the last CQE cannot
+    /// truncate the drain.
+    unsigned long long publish_limit;
 };
 
 // --- index math, shared verbatim by the kernel, the simulator and the tests ---

@@ -5,9 +5,6 @@
 // same owner-bit poll loop on a spinning host thread, which lets the ring, the
 // simulator and the metrics path be developed and tested without nvcc.
 //
-// It is a development crutch, not part of the design. Delete this file once the
-// CUDA toolkit is installed.
-//
 
 #include <atomic>
 #include <cstdio>
@@ -25,8 +22,7 @@ constexpr unsigned long long kPublishMask = 63ull;
 
 std::thread g_poller;
 
-/// Mirror of gnp_poll_kernel(). Kept structurally identical on purpose: if the
-/// protocol changes, both copies must change the same way.
+/// Mirror of gnp_poll_kernel(). Kept structurally identical on purpose.
 void poll_loop(CompletionRing ring, RingControl* ctrl, PollStats* stats,
                unsigned long long max_run_ns, unsigned int idle_backoff_ns) {
     auto status_of = [](CompletionDesc* d) {
@@ -41,8 +37,11 @@ void poll_loop(CompletionRing ring, RingControl* ctrl, PollStats* stats,
     unsigned long long idx = 0;
     uint32_t next_id = 0;
     bool have_prev = false;
+    bool saw_stop = false;
 
     auto* stop = reinterpret_cast<std::atomic<uint32_t>*>(&ctrl->stop_flag);
+    auto* publish_limit =
+        reinterpret_cast<std::atomic<unsigned long long>*>(&ctrl->publish_limit);
 
     for (;;) {
         CompletionDesc* d = &ring.descs[ring_slot(ring, idx)];
@@ -79,7 +78,11 @@ void poll_loop(CompletionRing ring, RingControl* ctrl, PollStats* stats,
             }
         } else {
             ++s.idle_spins;
-            if (stop->load(std::memory_order_acquire)) break;
+            if (stop->load(std::memory_order_acquire)) {
+                if (!saw_stop) saw_stop = true;
+                else ++s.drain_spins;
+                if (idx >= publish_limit->load(std::memory_order_acquire)) break;
+            }
             if ((s.idle_spins & 1023ull) == 0 && host_now_ns() - t_start > max_run_ns) break;
             if (idle_backoff_ns) std::this_thread::yield();
         }
@@ -94,25 +97,33 @@ void poll_loop(CompletionRing ring, RingControl* ctrl, PollStats* stats,
 
 const char* backend_name() { return "cpu-fallback"; }
 
+const char* backend_memory_strategy() { return "host heap (cpu-fallback)"; }
+
 bool backend_init(bool verbose) {
     if (verbose) {
         std::printf("[gnp] no CUDA compiler at build time; polling on a host thread\n");
+        std::printf("[gnp] shared-memory strategy: %s\n", backend_memory_strategy());
     }
     return true;
 }
 
-void* backend_alloc_shared(size_t bytes) {
-    // 256-byte alignment keeps descriptors off shared cache lines and matches
-    // what cudaMallocManaged would hand back.
-    void* p = ::operator new(bytes, std::align_val_t(256), std::nothrow);
-    return p;
+void* backend_alloc_shared(size_t bytes, bool /*write_combined*/) {
+    return ::operator new(bytes, std::align_val_t(256), std::nothrow);
 }
 
 void backend_free_shared(void* p) {
     if (p) ::operator delete(p, std::align_val_t(256));
 }
 
-int64_t backend_clock_offset_ns() { return 0; }  // one clock, no translation
+void* backend_alloc_host(size_t bytes) {
+    return ::operator new(bytes, std::align_val_t(64), std::nothrow);
+}
+
+void backend_free_host(void* p) {
+    if (p) ::operator delete(p, std::align_val_t(64));
+}
+
+int64_t backend_clock_offset_ns() { return 0; }
 
 bool backend_launch_poller(const CompletionRing& ring, RingControl* ctrl, PollStats* stats,
                            int64_t /*clock_offset_ns*/, const RunConfig& cfg) {
