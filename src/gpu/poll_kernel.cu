@@ -52,12 +52,11 @@ __global__ void gnp_poll_kernel(CompletionRing ring, RingControl* ctrl, PollStat
         const unsigned int slot = ring_slot(ring, idx);
         const unsigned int want = ring_expected_owner(ring, idx);
 
-        // System-scoped acquire on the owner bit: once we observe the producer's
-        // status store, subsequent payload loads cannot float above it. Much
-        // cheaper than __threadfence_system() on every hit (that was dominating
-        // the per-packet service time when the ring lives in mapped host memory).
+        // System-scoped acquire was needed when the CQ lived in host-mapped
+        // memory. The CQ is now device-resident; a GPU-scope acquire is enough
+        // and much cheaper on the critical path.
         unsigned int st;
-        asm volatile("ld.acquire.sys.u32 %0, [%1];"
+        asm volatile("ld.acquire.gpu.u32 %0, [%1];"
                      : "=r"(st)
                      : "l"(&descs[slot].status)
                      : "memory");
@@ -113,6 +112,7 @@ __global__ void gnp_poll_kernel(CompletionRing ring, RingControl* ctrl, PollStat
     }
 
     ctrl->consumed = idx;
+    s.run_ns = device_now_ns() - t_start;
     *stats = s;
     __threadfence_system();
 }
@@ -148,6 +148,7 @@ bool backend_wait_poller() {
 }
 
 void backend_shutdown() {
+    backend_fini_copy();
     if (g_stream) {
         cudaStreamDestroy(g_stream);
         g_stream = nullptr;

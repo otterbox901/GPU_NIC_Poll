@@ -22,6 +22,7 @@ struct PollStats {
     unsigned long long gaps;           ///< packet_id discontinuities
     unsigned long long clamped;        ///< latencies clamped to 0 by clock skew
     unsigned long long drain_spins;    ///< idle spins after stop while catching publish_limit
+    unsigned long long run_ns;         ///< device-side elapsed (%globaltimer) while poller ran
 };
 
 void stats_reset(PollStats& s);

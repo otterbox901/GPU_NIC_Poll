@@ -53,6 +53,12 @@ void report(const RunConfig& cfg, const PollStats& poll, const SimStats& sim, co
     if (poll.packets) {
         row_f64("idle spins per packet", static_cast<double>(poll.idle_spins) / poll.packets, "");
     }
+    if (poll.run_ns) {
+        row_f64("poller active", poll.run_ns / 1e6, "ms");
+        if (poll.packets) {
+            row_f64("service time", (poll.run_ns / static_cast<double>(poll.packets)) / 1e3, "us/pkt");
+        }
+    }
     if (elapsed_s > 0.0) {
         row_f64("goodput", poll.bytes * 8.0 / elapsed_s / 1e9, "Gb/s");
     }

@@ -5,10 +5,12 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstring>
 #include <new>
 
 #include "gnp/common.hpp"
 #include "gnp/gpu_poll.hpp"
+#include "gnp/ring.hpp"
 
 namespace gnp {
 namespace {
@@ -17,15 +19,32 @@ int  g_device = 0;
 bool g_initialised = false;
 const char* g_mem_strategy = "uninitialised";
 
+cudaStream_t g_copy_stream = nullptr;
+
 /// Spins until the host raises `flag`, then records the GPU clock.
-///
-/// Launching a kernel just to read %globaltimer would fold ~10 us of launch
-/// latency into the offset. Having the kernel already resident when the host
-/// takes its timestamp cuts that down to one PCIe hop.
 __global__ void gnp_clock_probe(volatile unsigned int* flag, unsigned long long* out) {
     while (*flag == 0) {
     }
     *out = device_now_ns();
+}
+
+/// Pull completed CQEs from pinned host staging into the device-resident ring.
+/// Each lane copies one descriptor and publishes status last.
+__global__ void gnp_flush_kernel(CompletionDesc* device, const CompletionDesc* host,
+                                 uint32_t start_slot, uint32_t count, uint32_t mask) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+
+    const uint32_t slot = (start_slot + i) & mask;
+    const CompletionDesc src = host[slot];
+
+    device[slot].payload_offset = src.payload_offset;
+    device[slot].byte_len = src.byte_len;
+    device[slot].packet_id = src.packet_id;
+    device[slot].post_ns = src.post_ns;
+    device[slot].reserved = src.reserved;
+    __threadfence();
+    device[slot].status = src.status;
 }
 
 }  // namespace
@@ -46,7 +65,8 @@ bool backend_init(bool verbose) {
     }
 
     GNP_CUDA_CHECK(cudaSetDevice(g_device));
-    g_mem_strategy = "pinned-mapped host (coherent)";
+    GNP_CUDA_CHECK(cudaStreamCreateWithFlags(&g_copy_stream, cudaStreamNonBlocking));
+    g_mem_strategy = "device CQ + pinned host staging (batched H2D flush)";
 
     if (verbose) {
         cudaDeviceProp p{};
@@ -71,6 +91,53 @@ void* backend_alloc_shared(size_t bytes, bool write_combined) {
 
 void backend_free_shared(void* p) {
     if (p) cudaFreeHost(p);
+}
+
+bool backend_alloc_ring(size_t bytes, CompletionDesc** host_out, CompletionDesc** device_out) {
+    void* host = nullptr;
+    void* device = nullptr;
+    GNP_CUDA_CHECK(cudaHostAlloc(&host, bytes, cudaHostAllocMapped));
+    GNP_CUDA_CHECK(cudaMalloc(&device, bytes));
+    GNP_CUDA_CHECK(cudaMemset(device, 0, bytes));
+    std::memset(host, 0, bytes);
+    *host_out = static_cast<CompletionDesc*>(host);
+    *device_out = static_cast<CompletionDesc*>(device);
+    return true;
+}
+
+void backend_free_ring(CompletionDesc* host, CompletionDesc* device) {
+    if (host) cudaFreeHost(host);
+    if (device) cudaFree(device);
+}
+
+void backend_flush_descs(CompletionDesc* host, CompletionDesc* device, uint32_t capacity,
+                         uint64_t start_idx, uint32_t count) {
+    if (!host || !device || count == 0 || host == device) return;
+
+    const uint32_t mask = capacity - 1;
+    const uint32_t start_slot = static_cast<uint32_t>(start_idx) & mask;
+
+    constexpr int kThreads = 64;
+    const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+    gnp_flush_kernel<<<blocks, kThreads, 0, g_copy_stream>>>(device, host, start_slot, count,
+                                                              mask);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "[gnp] flush launch failed: %s\n", cudaGetErrorString(e));
+        std::abort();
+    }
+}
+
+void backend_flush_wait() {
+    if (g_copy_stream) GNP_CUDA_CHECK(cudaStreamSynchronize(g_copy_stream));
+}
+
+void backend_fini_copy() {
+    if (g_copy_stream) {
+        cudaStreamSynchronize(g_copy_stream);
+        cudaStreamDestroy(g_copy_stream);
+        g_copy_stream = nullptr;
+    }
 }
 
 void* backend_alloc_host(size_t bytes) {
@@ -98,7 +165,6 @@ int64_t backend_clock_offset_ns() {
         gnp_clock_probe<<<1, 1>>>(flag, gpu_ns);
         GNP_CUDA_CHECK(cudaGetLastError());
 
-        // Let the probe reach its spin loop before we start the stopwatch.
         for (volatile int spin = 0; spin < 200000; ++spin) {
         }
 
@@ -110,8 +176,6 @@ int64_t backend_clock_offset_ns() {
         const uint64_t window = t1 - t0;
         if (window < best_window) {
             best_window = window;
-            // Midpoint of the host window is our best guess at the instant the
-            // GPU sampled its own clock.
             best_offset = static_cast<int64_t>(t0 + window / 2) - static_cast<int64_t>(*gpu_ns);
         }
     }

@@ -21,18 +21,27 @@ const char* backend_name();
 /// Select/probe the device. Returns false if the backend is unusable.
 bool backend_init(bool verbose);
 
-/// Allocate memory both the producer (CPU) and the consumer (SM) can reach.
-///
-/// CUDA backend uses pinned, mapped host memory (optionally write-combined for
-/// the ring). That keeps CPU publishes in local DRAM and lets the SM poll over
-/// PCIe - orders of magnitude faster than cudaMallocManaged with GPU-preferred
-/// pages, which thrash under bidirectional touch. A real NIC will DMA into
-/// device memory later; the poller interface stays the same.
-///
-/// `write_combined` is a hint for producer-heavy buffers (the CQ ring). Control
-/// and stats must pass false so the host can read them back.
+/// Control/stats: memory both sides can access (pinned mapped on CUDA).
 void* backend_alloc_shared(size_t bytes, bool write_combined = false);
 void  backend_free_shared(void* p);
+
+/// Completion ring: host staging (producer) + device-resident CQ (poller).
+/// On the CPU backend both pointers are equal. On CUDA, `host_out` is pinned
+/// staging and `device_out` is cudaMalloc'd GPU memory the SM polls locally.
+bool backend_alloc_ring(size_t bytes, CompletionDesc** host_out, CompletionDesc** device_out);
+void backend_free_ring(CompletionDesc* host, CompletionDesc* device);
+
+/// Copy `count` completed CQEs from host staging into the device ring, starting
+/// at monotonic index `start_idx`. Status is published last per slot so the
+/// poller never sees a torn descriptor. No-op when host == device.
+void backend_flush_descs(CompletionDesc* host, CompletionDesc* device, uint32_t capacity,
+                         uint64_t start_idx, uint32_t count);
+
+/// Wait for outstanding flushes (call after the producer joins, before stop).
+void backend_flush_wait();
+
+/// Tear down the H2D copy stream (called from backend_shutdown).
+void backend_fini_copy();
 
 /// Host-only allocation (payload arena). The poller never touches packet bytes.
 void* backend_alloc_host(size_t bytes);
@@ -45,24 +54,22 @@ const char* backend_memory_strategy();
 /// epoch. Zero for the CPU fallback.
 int64_t backend_clock_offset_ns();
 
-/// Launch the persistent poller. Returns immediately; the poller runs until
-/// RingControl::stop_flag is set.
+/// Launch the persistent poller. `ring.descs` must be the device-side pointer.
 bool backend_launch_poller(const CompletionRing& ring, RingControl* ctrl, PollStats* stats,
                            int64_t clock_offset_ns, const RunConfig& cfg);
 
-/// Block until the poller has retired.
 bool backend_wait_poller();
 
 void backend_shutdown();
 
 // --- session ----------------------------------------------------------------
 
-/// Everything one run allocates. Created by setup.cpp.
 struct Session {
-    CompletionRing ring;
+    CompletionRing ring;                 ///< .descs = device pointer (poller)
+    CompletionDesc* host_descs = nullptr; ///< producer staging (equals ring.descs on CPU)
     RingControl*   ctrl   = nullptr;
     PollStats*     stats  = nullptr;
-    uint8_t*       arena  = nullptr;   ///< simulated packet payload buffer
+    uint8_t*       arena  = nullptr;
     size_t         arena_bytes = 0;
     int64_t        clock_offset_ns = 0;
 };

@@ -90,6 +90,7 @@ void poll_loop(CompletionRing ring, RingControl* ctrl, PollStats* stats,
 
     reinterpret_cast<std::atomic<unsigned long long>*>(&ctrl->consumed)
         ->store(idx, std::memory_order_release);
+    s.run_ns = host_now_ns() - t_start;
     *stats = s;
 }
 
